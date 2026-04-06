@@ -1,0 +1,211 @@
+# =============================================================================
+# SecureFin App — CI Pipeline (Build → Scan → Push → GitOps Update)
+# =============================================================================
+# FLOW:
+#   1. Checkout + setup Node
+#   2. npm ci (install deps)
+#   3. Docker build (multi-stage)
+#   4. Trivy vulnerability scan (fail on CRITICAL)
+#   5. Azure Login (OIDC — zero secrets)
+#   6. Push image to ACR with immutable tag: <branch>-<sha7>
+#   7. Clone securefin-gitops → update image tag → commit + push
+#
+# TRIGGERS: push/PR to dev, staging, production.
+# PR builds: build + scan only (no push, no gitops update).
+# Push builds: full pipeline (build → push → gitops update).
+#
+# IMAGE TAGGING:
+#   - <branch>-<sha7>  → unique per commit (e.g. dev-a1b2c3d)
+#   - NEVER uses :latest — every image is traceable to a git commit
+# =============================================================================
+
+name: "App CI — Build, Scan & Deploy"
+
+on:
+  pull_request:
+    branches: [dev, staging, production]
+  push:
+    branches: [dev, staging, production]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: app-ci-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  ACR_NAME: acrsecurefin${{ github.base_ref || github.ref_name }}
+  IMAGE_NAME: securefin-app
+
+jobs:
+  # ===========================================================================
+  # JOB: BUILD → SCAN → PUSH → GITOPS UPDATE
+  # ===========================================================================
+  build-and-push:
+    name: "Build & Push — ${{ github.base_ref || github.ref_name }}"
+    runs-on: ubuntu-latest
+
+    env:
+      IS_PUSH: ${{ github.event_name == 'push' }}
+      BRANCH: ${{ github.base_ref || github.ref_name }}
+
+    steps:
+      # ----------------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # 2. Setup Node.js + install dependencies
+      # ----------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      # ----------------------------------------------------------------
+      # 3. Compute image metadata
+      # ----------------------------------------------------------------
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_TAG="${{ env.BRANCH }}-${SHORT_SHA}"
+          FULL_REF="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "full_image_ref=${FULL_REF}" >> "$GITHUB_OUTPUT"
+
+          echo "### Image Metadata" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ACR | \`${{ env.ACR_NAME }}.azurecr.io\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Full Ref | \`${FULL_REF}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------
+      # 4. Docker Build
+      # ----------------------------------------------------------------
+      - name: Docker Build
+        run: |
+          docker build \
+            --tag ${{ steps.meta.outputs.full_image_ref }} \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            .
+
+      # ----------------------------------------------------------------
+      # 5. Trivy Vulnerability Scan
+      # ----------------------------------------------------------------
+      # WHY: Catches known CVEs in OS packages and npm deps BEFORE the
+      # image reaches ACR. Fails the pipeline on CRITICAL severity.
+      # NOTE: Tags use 'v' prefix since the supply-chain migration.
+      # ----------------------------------------------------------------
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ steps.meta.outputs.full_image_ref }}
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL"
+          ignore-unfixed: true
+
+      # ----------------------------------------------------------------
+      # 6. Azure Login (OIDC — zero secrets)
+      # ----------------------------------------------------------------
+      - name: Azure Login (OIDC)
+        if: env.IS_PUSH == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # ----------------------------------------------------------------
+      # 7. Push to ACR
+      # ----------------------------------------------------------------
+      - name: ACR Login
+        if: env.IS_PUSH == 'true'
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Docker Push
+        if: env.IS_PUSH == 'true'
+        run: |
+          docker push ${{ steps.meta.outputs.full_image_ref }}
+
+          echo "### Push Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image pushed to \`${{ env.ACR_NAME }}.azurecr.io\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------
+      # 8. Update GitOps Repo (image tag in values.yaml)
+      # ----------------------------------------------------------------
+      # WHY: This is the GitOps bridge — CI never touches kubectl.
+      # Instead, CI updates the declarative state in the gitops repo.
+      # ArgoCD watches that repo and reconciles the cluster.
+      #
+      # FLOW:
+      #   a. Clone securefin-gitops (same branch as the push target)
+      #   b. Update image.tag in environments/<env>/values.yaml
+      #   c. Commit + push → ArgoCD detects → deploys
+      #
+      # AUTH: Uses a GitHub PAT (GITOPS_PAT) stored as a repo secret.
+      # The PAT needs 'contents: write' on securefin-gitops.
+      # ----------------------------------------------------------------
+      - name: Update GitOps Repo
+        if: env.IS_PUSH == 'true'
+        env:
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        run: |
+          set -euo pipefail
+
+          ENV="${{ env.BRANCH }}"
+          IMAGE_TAG="${{ steps.meta.outputs.image_tag }}"
+
+          echo "Updating GitOps repo: env=${ENV}, tag=${IMAGE_TAG}"
+
+          # Clone the gitops repo (same branch)
+          git clone --branch "${ENV}" --single-branch \
+            "https://x-access-token:${GITOPS_PAT}@github.com/TashdidAlam/securefin-gitops.git" \
+            /tmp/securefin-gitops
+
+          cd /tmp/securefin-gitops
+
+          VALUES_FILE="environments/${ENV}/values.yaml"
+
+          if [[ ! -f "${VALUES_FILE}" ]]; then
+            echo "::error::Values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          # Replace the image.tag value using sed
+          # Matches:  tag: "anything"  or  tag: anything
+          sed -i "s|^\(\s*tag:\s*\).*|\1\"${IMAGE_TAG}\"|" "${VALUES_FILE}"
+
+          echo "Updated ${VALUES_FILE}:"
+          cat "${VALUES_FILE}"
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Commit and push
+          git add "${VALUES_FILE}"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "ci: update ${ENV} image tag to ${IMAGE_TAG}
+
+          Source: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          Pipeline: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          git push origin "${ENV}"
+
+          echo "### GitOps Update" >> "$GITHUB_STEP_SUMMARY"
+          echo "Updated \`${VALUES_FILE}\` with tag \`${IMAGE_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
