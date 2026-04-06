@@ -47,8 +47,14 @@ COPY frontend/ ./public/
 # ---------------------------------------------------------------------------
 FROM node:18-alpine
 
-# Remove npm/yarn (not needed at runtime — reduces attack surface)
-RUN npm cache clean --force && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+# Patch OS-level CVEs (e.g. CVE-2025-15467 in libcrypto3/libssl3), then
+# remove npm/yarn/corepack (not needed at runtime — reduces attack surface)
+RUN apk update && apk upgrade --no-cache \
+    && npm cache clean --force \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+              /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+              /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
+    && rm -rf /var/cache/apk/*
 
 WORKDIR /app
 
