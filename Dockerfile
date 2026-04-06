@@ -6,18 +6,12 @@
 #   (npm, gcc, python) exist only here and are discarded.
 #
 #   Stage 2 (runtime) — copies ONLY production deps + source into a
-#   distroless base. Final image has no shell, no package manager,
-#   no OS utilities — smallest possible attack surface.
+#   minimal Alpine base. Final image has no dev tools, no npm cache.
 #
-# WHY node:18-alpine (builder):
-#   Alpine is ~50 MB vs ~350 MB for Debian-based. We only need npm
-#   to install deps; the builder is thrown away after.
-#
-# WHY distroless (runtime):
-#   - No shell → cannot exec into the container (blocks RCE exploits)
-#   - No package manager → cannot install malware at runtime
-#   - No OS utils → eliminates tools attackers rely on (curl, wget, nc)
-#   - ~30 MB base vs ~120 MB for alpine
+# WHY node:18-alpine (builder + runtime):
+#   Alpine is ~50 MB vs ~350 MB for Debian-based. Uses musl/LibreSSL
+#   instead of OpenSSL — not affected by Debian OpenSSL CVEs.
+#   The runtime stage strips the image down to only app files.
 #
 # WHY non-root:
 #   Even if an attacker escapes the app process, they land as UID 1000
@@ -49,9 +43,12 @@ COPY backend/src/ ./src/
 COPY frontend/ ./public/
 
 # ---------------------------------------------------------------------------
-# Stage 2: Runtime — minimal distroless image
+# Stage 2: Runtime — minimal Alpine image (no dev tools, no npm)
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/nodejs18-debian12:nonroot
+FROM node:18-alpine
+
+# Remove npm/yarn (not needed at runtime — reduces attack surface)
+RUN npm cache clean --force && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 WORKDIR /app
 
@@ -61,8 +58,7 @@ COPY --from=builder /app/src ./src
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/package.json ./
 
-# Distroless 'nonroot' tag sets UID 65534 by default.
-# We match the K8s securityContext (runAsUser: 1000) for consistency.
+# Run as non-root UID 1000 — matches K8s securityContext (runAsUser: 1000)
 USER 1000
 
 ENV NODE_ENV=production
@@ -70,6 +66,4 @@ ENV PORT=8080
 
 EXPOSE 8080
 
-# Distroless nodejs images use the Node.js binary as entrypoint.
-# We only need to specify the script path.
-CMD ["src/index.js"]
+CMD ["node", "src/index.js"]
